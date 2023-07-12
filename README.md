@@ -43,3 +43,20 @@ You can also launch this entire repo on qBraid by clicking on the button below:
 [<img src="https://qbraid-static.s3.amazonaws.com/logos/Launch_on_qBraid_white.png" width="150">](https://account.qbraid.com?gitHubUrl=https://github.com/QuEraComputing/quera-education.git)
 
 **NOTE:** Access to Bloqade on qBraid is still in development and requires a specific access code. Contact QuEra if you are interested in support for this access at info@quera.com.
+
+## Citing
+
+If you would like to acknowledge usage of any of the materials in this repo, please use the following format:
+
+> J. Long, P. Lopes. (2023) *QuEra Educational Materials*
+
+You may also use the bibtex citation below:
+
+```bibtex
+@misc{Long_Lopes_2023, 
+      title={QuEra Educational Materials}, 
+      url={https://github.com/QuEraComputing/quera-education}, 
+      publisher={QuEra Computing Inc.}, 
+      author={Long, John and Lopes, Pedro}, 
+      year={2023}} 
+```
