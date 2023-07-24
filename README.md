@@ -30,7 +30,7 @@ julia>
 ```
 Now copy and paste the following into the prompt:
 ```julia
-using Pkg, Pkg.add(["Bloqade", "BloqadeExpr", "BloqadeSchema", "Graphs", "PythonCall", "IJulia", "JSON3"])
+using Pkg; Pkg.add(["Bloqade", "BloqadeExpr", "BloqadeSchema", "Graphs", "PythonCall", "IJulia", "JSON3"])
 ```
 Once the installation is complete you can exit Julia and launch jupyter lab/jupyter notebook from your terminal (ensuring you're launching it from the folder where all these tutorials are). The `IJulia` package you installed earlier should have installed a jupyter kernel that enables Julia code to be executed inside Jupyter notebooks. 
 
