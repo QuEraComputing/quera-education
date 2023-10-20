@@ -44,6 +44,10 @@ You can also launch this entire repo on qBraid by clicking on the button below:
 
 **NOTE:** Access to Bloqade on qBraid is still in development and requires a specific access code. Contact QuEra if you are interested in support for this access at info@quera.com.
 
+## 🚀 Bloqade SDK for Python 🚀
+
+We're very happy to annouce the Alpha release of [Bloqade for Python](https://github.com/QuEraComputing/bloqade-python)! Check the documentation to [get started](https://bloqade.quera.com/0.8.0/#how-do-i-get-started). We are in active development of this new package so we appreciate [feedback](https://bloqade.quera.com/0.8.0/contributing/providing-feedback/) during the Alpha phase.
+
 ## Citing
 
 If you would like to acknowledge usage of any of the materials in this repo, please use the following format:
