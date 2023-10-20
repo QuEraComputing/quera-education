@@ -46,7 +46,9 @@ You can also launch this entire repo on qBraid by clicking on the button below:
 
 ## 🚀 Bloqade SDK for Python 🚀
 
-We're very happy to annouce the Alpha release of [Bloqade for Python](https://github.com/QuEraComputing/bloqade-python)! Check the documentation to [get started](https://bloqade.quera.com/0.8.0/#how-do-i-get-started). We are in active development of this new package so we appreciate [feedback](https://bloqade.quera.com/0.8.0/contributing/providing-feedback/) during the Alpha phase.
+While you're experimenting and learning to hack netural atoms with the Julia versin of Bloqade, we also encourage you to check out the Alpha release of [Bloqade for Python](https://github.com/QuEraComputing/bloqade-python)! The Python version will eventually have an interface to the Julia version, giving you unparalleled performance for testing your ideas out along with a clear syntax for constructing programs on real neutral atom hardware.
+
+Check the documentation to [get started](https://bloqade.quera.com/0.8.0/#how-do-i-get-started). We are in active development of this new package so we appreciate [feedback](https://bloqade.quera.com/0.8.0/contributing/providing-feedback/) during the Alpha phase.
 
 ## Citing
 
