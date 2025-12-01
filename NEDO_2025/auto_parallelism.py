@@ -15,6 +15,12 @@
 #     name: python3
 # ---
 
+#%% [markdown]
+#
+# # !! This tutorial is a work in progress.
+# I am currently merging
+# the auto-parallelism tutorial from bloqade, and circuit_noise from IEEE.
+
 # %% [markdown]
 # # Parallelism of Static Circuits
 #
@@ -70,6 +76,9 @@ def build_linear_ghz(n_qubits: int) -> cirq.Circuit:
     circuit = cirq_utils.emit_circuit(linear_ghz_kernel, circuit_qubits=qubits)
     return circuit
 
+linear_ghz = build_linear_ghz(8)
+SVGCircuit(linear_ghz)
+#%%
 
 def build_log_ghz(n_qubits: int) -> cirq.Circuit:
     """Build logarithmic-depth GHZ circuit using squin and convert to Cirq."""
@@ -95,8 +104,7 @@ def build_log_ghz(n_qubits: int) -> cirq.Circuit:
     circuit = cirq_utils.emit_circuit(log_ghz_kernel, circuit_qubits=qubits)
     return circuit
 
-linear_ghz = build_linear_ghz(8)
-SVGCircuit(linear_ghz)
+
 log_ghz = build_log_ghz(8)
 SVGCircuit(log_ghz)
 
@@ -127,7 +135,7 @@ fidelities_log = []
 # We run noise-model simulations for circuit sizes from 3 to 9 qubits and compute the fidelity (the higher is better). The ideal noiseless circuit has fidelity 1 by construction.
 
 # %%
-qubits = range(3, 9)
+qubits = range(3, 11)
 # Test both linear and log GHZ circuits with noise model
 for n in qubits:
     # Linear GHZ circuit
@@ -196,6 +204,7 @@ plt.title(
 plt.legend(fontsize=12)
 plt.grid(True, alpha=0.3)
 plt.xticks(qubits)
+plt.axis([min(qubits)-0.5, max(qubits)+0.5, 0.6, 1.05])
 
 # Add annotations for better understanding
 plt.text(
