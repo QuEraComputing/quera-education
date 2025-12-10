@@ -18,7 +18,7 @@
 #%% [markdown]
 # # Programming Gemini with Bloqade
 #
-# In this tutorial we will demonstrate how to write circuits and quantum executions with Bloqade, as well as analyize and improve performance of these circuits using noise simulations. There are two main parts to the tutorial. The first introduces how to write bloqade kernels, as well as simulate them using both a noiseless PyQRack and noisy Cirq backend. This part is a modified version of the "[Circuits with Bloqade](https://bloqade.quera.com/latest/digital/tutorials/circuits_with_bloqade/)" tutorial and the "[GHZ state preparation](https://bloqade.quera.com/latest/digital/examples/interop/noisy_ghz/)" tutorials.
+# In this tutorial we will demonstrate how to write circuits and quantum executions with Bloqade, as well as analyize and improve performance of these circuits using noise simulations. There are two main parts to the tutorial. The first part introduces how to write bloqade kernels, as well as simulate them using both a noiseless PyQRack and noisy Cirq backend. This part is a modified version of the "[Circuits with Bloqade](https://bloqade.quera.com/latest/digital/tutorials/circuits_with_bloqade/)" tutorial and the "[GHZ state preparation](https://bloqade.quera.com/latest/digital/examples/interop/noisy_ghz/)" tutorials.
 # The second part focuses on circuit parallelism, and how to improve circuit performance by maximizing parallel gate execution. It is based on the "[Parallelism of Static Circuits](https://github.com/QuEraComputing/bloqade/pull/288)" tutorial.
 
 # %%
@@ -30,9 +30,7 @@ from bloqade import squin, cirq_utils
 import bloqade.cirq_utils as utils
 from cirq.contrib.svg import SVGCircuit
 
-import bloqade.types
-from kirin.ir import Method
-from bloqade.types import Qubit, MeasurementResult
+from bloqade.types import MeasurementResult, Qubit
 
 # Some types we will use, useful for type hints
 from kirin.dialects.ilist import IList
@@ -42,9 +40,9 @@ import warnings
 warnings.filterwarnings("ignore")
 
 #%% [markdown]
-#Bloqade uses the `squin` dialect set from the compiler toolchain `kirin`. `SQUIN` stands for `S`tructural `Qu`antum `IN`struction set and is the circuit-level representation of quantum executions. It is built on top of the `kirin` framework, an [open-source compiler toolchain](https://queracomputing.github.io/kirin/latest/) for embedded domain-specific languages (eDSLs) that target scientific computing kernels. A key feature of squin is the _kernel_, which can roughly be seen as the object which will be executed on the target hardware. Naturally, this hardware could be a quantum computer, but it also extends to classical execution as well, such as mid-circuit feedforward or even non-quantum execution such as robotics.
+#Bloqade uses the `squin` dialect set from the compiler toolchain `kirin`. `SQUIN` stands for `S`tructural `Qu`antum `IN`struction set and is the circuit-level representation of quantum executions. It is built on top of the `kirin` framework, an [open-source compiler toolchain](https://queracomputing.github.io/kirin/latest/) for embedded domain-specific languages (eDSLs) that target scientific computing kernels. A key feature of squin is the _kernel_, which can roughly be seen as the object which will be executed on the target hardware. Naturally, this hardware could be a quantum computer, but it also extends to classical execution as well, such as mid-circuit feedforward or even non-quantum execution such as robotics. For more details, please check out the [squin documentation here](https://bloqade.quera.com/latest/digital/).
 #
-# These kernels can be built using decorators of python functions. We will use the `@squin.kernel` decorator in this notebook but keep in mind that other eDSLs have different decorators inherited from base Kirin decorators. The decorator lowers Python's abstract syntax tree (AST) into a kirin SSA (single static assignment) form, which is a useful intermediate representation for compiler analysis. You don't have to worry too much about SSA or compilers here, but if you want to learn more check out the [kirin documentation](https://queracomputing.github.io/kirin/latest/).
+# Kernels can be built using decorators of python functions. We will use the `@squin.kernel` decorator in this notebook but keep in mind that other eDSLs have different decorators inherited from base Kirin decorators. The decorator lowers Python's abstract syntax tree (AST) into a kirin SSA (single static assignment) form, which is a useful intermediate representation for compiler analysis. You don't have to worry too much about SSA or compilers here, but if you want to learn more check out the [kirin documentation](https://queracomputing.github.io/kirin/latest/).
 #%%
 
 @squin.kernel
@@ -58,6 +56,36 @@ def hello_world(theta: float) -> IList[MeasurementResult, Any]:
     squin.rx(theta, qubits[0])
     bits = squin.broadcast.measure(qubits)
     return bits
+
+#%% [markdown]
+# SQUIN kernels can also let you do complex control flow with mid-circuit measurements and feedforward. Here is an example of a constant-depth GHZ state preparation that uses feedforward. For more details, check out [Efficient Long-Range Entanglement Using Dynamic Circuits](https://doi.org/10.1103/PRXQuantum.5.030339)
+
+# %%
+def ghz_constant_depth(n_qubits: int):
+
+    @squin.kernel
+    def main()->IList[Qubit, Any]:
+        qreg = squin.qalloc(n_qubits)
+        ancilla = squin.qalloc(n_qubits - 1)
+
+        for i in range(n_qubits):
+            squin.h(qreg[i])
+
+        for i in range(n_qubits - 1):
+            squin.cx(qreg[i], ancilla[i])
+        for i in range(n_qubits - 1):
+            squin.cx(qreg[i + 1], ancilla[i])
+
+        parity: int = 0
+        bits = squin.broadcast.measure(ancilla)
+        for i in range(n_qubits - 1):
+            parity = parity ^ bits[i]
+            if parity == 1:
+                squin.x(qreg[i + 1])
+        return qreg
+
+    return main
+
 
 # %% [markdown]
 
@@ -97,10 +125,23 @@ circuit2_cirq_bell_prep: cirq.Circuit = cirq_utils.emit_circuit(kernel, ignore_r
 from bloqade.pyqrack import StackMemorySimulator
 emulator = StackMemorySimulator(min_qubits=8)
 
+#%%
 task = emulator.task(hello_world, args=(0.0,))
 results = task.run() # Run once
 results_batch = task.batch_run(1000) # Run 1000 times
 print(results_batch)
+
+#%% And lets do the same for the constant-depth GHZ state
+emulator = StackMemorySimulator(min_qubits=7)
+task = emulator.task(ghz_constant_depth(3))
+
+state = task.batch_state(shots=1000, qubit_map=lambda x: x)
+# Even though there is measurement and feedforward, the final state is still pure. Neat!
+print(state.eigenvalues)
+print(state.eigenvectors)
+# %% [markdown]
+# As a final note, consider how difficult it would be to represent this circuit in Cirq. In particular, there is a for loop, where inside the for loop there is an algebraic operation (XOR) that feeds forward onto a variable (parity). This circuit is very hard to express in Cirq without some serious hacking of ancilla registers.
+
 
 #%% [markdown]
 # # Noisy simulation of circuits with Cirq
@@ -131,13 +172,14 @@ fidelity = np.trace(clean @ noisy).real
 print("Fidelity of noisy Bell prep circuit:", fidelity)
 
 #%% [markdown]
+# # Exploration: Global vs Local gates
 # Lets reproduce the insight of comparing global and local gates, as shown in the slides. Lets prepare K states in the |+> state and N-K states in the |0> state, and compare applying global $\sqrt{Y}$ gates and then a local correction, vs. just local $\sqrt{Y}$ gates.
 
 #%%
 
 sqrt_Y = cirq.PhasedXZGate(axis_phase_exponent=0.5,x_exponent=0.5,z_exponent=0)
 sqrt_Y_dag = cirq.PhasedXZGate(axis_phase_exponent=0.5,x_exponent=-0.5,z_exponent=0)
-identity = cirq.PhasedXZGate(axis_phase_exponent=0.0,x_exponent=0.0,z_exponent=0)
+identity = cirq.I#cirq.PhasedXZGate(axis_phase_exponent=0.0,x_exponent=0.0,z_exponent=0)
 
 # Care must be taken to line up global and local gates, by putting all gates in a single moment.
 Nqubits = 10
@@ -154,7 +196,7 @@ for k in range(1,Nqubits):
         cirq.Moment([sqrt_Y.on(q) for q in qubits]))
     circuit_global2 = cirq.Circuit.from_moments(
         cirq.Moment([identity.on(q) for q in qubits]),
-        cirq.Moment([sqrt_Y.on(q) for q in qubits[k::]]))
+        cirq.Moment([sqrt_Y_dag.on(q) for q in qubits[k::]]))
     noisy_circuit_global1 = transform_circuit(circuit_global1)
     noisy_circuit_global2 = transform_circuit(circuit_global2)
     noisy_circuit_global = noisy_circuit_global1 + noisy_circuit_global2
@@ -165,6 +207,10 @@ for k in range(1,Nqubits):
         cirq.Moment([identity.on(q) for q in qubits]),
         cirq.Moment([sqrt_Y.on(q) for q in qubits[0:k]]))
     noisy_circuit_local = transform_circuit(circuit_local)
+    
+    if k==4:
+        todraw_1 = circuit_local
+        todraw_2 = circuit_global1 + circuit_global2[1::]
     
     # Simulate noisy circuits and compute fidelities
     # Local:
@@ -182,6 +228,11 @@ plt.xlabel("Number of gates to apply")
 plt.ylabel("Fidelity")
 plt.axis([1,Nqubits-1,plt.axis()[2],1.0])
 plt.show()
+
+#%%
+SVGCircuit(todraw_1)
+#%%
+SVGCircuit(todraw_2)
 
 # %% [markdown]
 # # Parallelism of Static Circuits
@@ -682,3 +733,5 @@ plt.show()
 # %% [markdown]
 # As expected, the manual and optimized circuits do better than their naively optimized counterparts. The "worst case" sequential circuit has the lowest fidelity, while the auto-optimized 9 CZ circuit has the highest fidelity. However, this also comes with a point of warning: the noise model is not a perfect representation of real hardware. In practice, the hand optimized 9-CZ circuit was implemented as part of QuEra's [magic state distillation paper](https://arxiv.org/abs/2412.15165), which suggests that the noise model is not aligned with hardware. The next steps after manual and automatic optimization should be implementation and tuning on real hardware.
 
+
+# %%
