@@ -16,15 +16,228 @@
 # ---
 
 #%% [markdown]
+# # Programming Gemini with Bloqade
 #
-# # !! This tutorial is a work in progress.
-# I am currently merging
-# the auto-parallelism tutorial from bloqade, and circuit_noise from IEEE.
+# In this tutorial we will demonstrate how to write circuits and quantum executions with Bloqade, as well as analyize and improve performance of these circuits using noise simulations. There are two main parts to the tutorial. The first part introduces how to write bloqade kernels, as well as simulate them using both a noiseless PyQRack and noisy Cirq backend. This part is a modified version of the "[Circuits with Bloqade](https://bloqade.quera.com/latest/digital/tutorials/circuits_with_bloqade/)" tutorial and the "[GHZ state preparation](https://bloqade.quera.com/latest/digital/examples/interop/noisy_ghz/)" tutorials.
+# The second part focuses on circuit parallelism, and how to improve circuit performance by maximizing parallel gate execution. It is based on the "[Parallelism of Static Circuits](https://github.com/QuEraComputing/bloqade/pull/288)" tutorial.
+
+# %%
+from typing import Any
+import cirq
+import matplotlib.pyplot as plt
+import numpy as np
+from bloqade import squin, cirq_utils
+import bloqade.cirq_utils as utils
+from cirq.contrib.svg import SVGCircuit
+
+from bloqade.types import MeasurementResult, Qubit
+
+# Some types we will use, useful for type hints
+from kirin.dialects.ilist import IList
+
+
+import warnings
+warnings.filterwarnings("ignore")
+
+#%% [markdown]
+#Bloqade uses the `squin` dialect set from the compiler toolchain `kirin`. `SQUIN` stands for `S`tructural `Qu`antum `IN`struction set and is the circuit-level representation of quantum executions. It is built on top of the `kirin` framework, an [open-source compiler toolchain](https://queracomputing.github.io/kirin/latest/) for embedded domain-specific languages (eDSLs) that target scientific computing kernels. A key feature of squin is the _kernel_, which can roughly be seen as the object which will be executed on the target hardware. Naturally, this hardware could be a quantum computer, but it also extends to classical execution as well, such as mid-circuit feedforward or even non-quantum execution such as robotics. For more details, please check out the [squin documentation here](https://bloqade.quera.com/latest/digital/).
+#
+# Kernels can be built using decorators of python functions. We will use the `@squin.kernel` decorator in this notebook but keep in mind that other eDSLs have different decorators inherited from base Kirin decorators. The decorator lowers Python's abstract syntax tree (AST) into a kirin SSA (single static assignment) form, which is a useful intermediate representation for compiler analysis. You don't have to worry too much about SSA or compilers here, but if you want to learn more check out the [kirin documentation](https://queracomputing.github.io/kirin/latest/).
+#%%
+
+@squin.kernel
+def hello_world(theta: float) -> IList[MeasurementResult, Any]:
+    """
+    Prepare a Bell state and measure in a basis that might have a Bell violation
+    """
+    qubits = squin.qalloc(2)
+    squin.h(qubits[0])
+    squin.cx(qubits[0], qubits[1])
+    squin.rx(theta, qubits[0])
+    bits = squin.broadcast.measure(qubits)
+    return bits
+
+#%% [markdown]
+# SQUIN kernels can also let you do complex control flow with mid-circuit measurements and feedforward. Here is an example of a constant-depth GHZ state preparation that uses feedforward. For more details, check out [Efficient Long-Range Entanglement Using Dynamic Circuits](https://doi.org/10.1103/PRXQuantum.5.030339)
+
+# %%
+def ghz_constant_depth(n_qubits: int):
+
+    @squin.kernel
+    def main()->IList[Qubit, Any]:
+        qreg = squin.qalloc(n_qubits)
+        ancilla = squin.qalloc(n_qubits - 1)
+
+        for i in range(n_qubits):
+            squin.h(qreg[i])
+
+        for i in range(n_qubits - 1):
+            squin.cx(qreg[i], ancilla[i])
+        for i in range(n_qubits - 1):
+            squin.cx(qreg[i + 1], ancilla[i])
+
+        parity: int = 0
+        bits = squin.broadcast.measure(ancilla)
+        for i in range(n_qubits - 1):
+            parity = parity ^ bits[i]
+            if parity == 1:
+                squin.x(qreg[i + 1])
+        return qreg
+
+    return main
+
+
+# %% [markdown]
+
+# We choose to interop with cirq, so we can convert to and from cirq circuits easily. However, note that due to the flexibility of kernels representing classical control flow, not every squin kernel can be converted to a cirq circuit. In particular, kernels with mid-circuit measurements and feedforward cannot be represented as cirq circuits.
+
+#%%
+def bell_prep() -> cirq.Circuit:
+    """
+    Builder function that returns a simple N-qubit
+    GHZ state preparation circuit
+    """
+    qubits = cirq.LineQubit.range(2)
+    output = cirq.Circuit()
+    output.append(cirq.H(qubits[0]))
+    output.append(cirq.CX(qubits[0], qubits[1]))
+    return output
+
+circuit_cirq_bell_prep = bell_prep()
+# Load a cirq circuit into squin
+kernel = cirq_utils.load_circuit(
+    circuit_cirq_bell_prep,
+    kernel_name="bell_prep_cirq",  # Define the name of the kernel as if one were using @squin.kernel on a function
+    register_as_argument=False,  # If the resulting kernel should take in a qubit register (True) or make a new one (False)
+    return_register=True,  # If the resulting kernel should return the register of the qubits it acts on.
+)
+
+# Then, we can convert the circuit back to cirq as a roundtrip.
+# Note that this is **not possible** in a general case because
+# cirq cannot represent complex control flow.
+circuit2_cirq_bell_prep: cirq.Circuit = cirq_utils.emit_circuit(kernel, ignore_returns=True)
+
+#%% [markdown]
+# # Noiseless simulation of arbitrary kernels with PyQRack
+# The first option for simulation is to use the [PyQrack quantum simulator](https://pyqrack.readthedocs.io/en/latest/) backend, which can handle arbitrary feed forward operations. Furthermore, the simulator can switch between different backends, and so is capable of simulating large Clifford circuits with a stabilizer simulator, or small general circuits with a state vector simulator. Lets check out using the PyQrack backend to simulate the `hello_world` kernel defined above.
+
+#%%
+from bloqade.pyqrack import StackMemorySimulator
+emulator = StackMemorySimulator(min_qubits=8)
+
+#%%
+task = emulator.task(hello_world, args=(0.0,))
+results = task.run() # Run once
+results_batch = task.batch_run(1000) # Run 1000 times
+print(results_batch)
+
+#%% And lets do the same for the constant-depth GHZ state
+emulator = StackMemorySimulator(min_qubits=7)
+task = emulator.task(ghz_constant_depth(3))
+
+state = task.batch_state(shots=1000, qubit_map=lambda x: x)
+# Even though there is measurement and feedforward, the final state is still pure. Neat!
+print(state.eigenvalues)
+print(state.eigenvectors)
+# %% [markdown]
+# As a final note, consider how difficult it would be to represent this circuit in Cirq. In particular, there is a for loop, where inside the for loop there is an algebraic operation (XOR) that feeds forward onto a variable (parity). This circuit is very hard to express in Cirq without some serious hacking of ancilla registers.
+
+
+#%% [markdown]
+# # Noisy simulation of circuits with Cirq
+# The second option for simulation is to use Cirq and noise-annotated circuits. As commented above, not every squin kernel can be converted to a cirq circuit, so this method is limited to kernels without midcircuit measurement and feed forward.
+
+#%%
+from bloqade.cirq_utils.noise import (
+    transform_circuit,
+    GeminiOneZoneNoiseModel,
+    GeminiTwoZoneNoiseModel,
+)
+
+import qsimcirq
+simulator_sv = qsimcirq.QSimSimulator() # Much faster state vector simulator
+simulator_dm = cirq.DensityMatrixSimulator()
+#%%
+circuit_cirq_bell_prep = bell_prep()
+model = GeminiOneZoneNoiseModel()
+
+noisy_circuit_cirq_bell_prep = transform_circuit(circuit_cirq_bell_prep, model=model)
+
+# Simulate noisy circuits
+clean = simulator_dm.simulate(circuit_cirq_bell_prep).final_density_matrix
+noisy = simulator_dm.simulate(noisy_circuit_cirq_bell_prep).final_density_matrix
+
+# Calculate fidelities
+fidelity = np.trace(clean @ noisy).real
+print("Fidelity of noisy Bell prep circuit:", fidelity)
+
+#%% [markdown]
+# # Exploration: Global vs Local gates
+# Lets reproduce the insight of comparing global and local gates, as shown in the slides. Lets prepare K states in the |+> state and N-K states in the |0> state, and compare applying global $\sqrt{Y}$ gates and then a local correction, vs. just local $\sqrt{Y}$ gates.
+
+#%%
+
+sqrt_Y = cirq.PhasedXZGate(axis_phase_exponent=0.5,x_exponent=0.5,z_exponent=0)
+sqrt_Y_dag = cirq.PhasedXZGate(axis_phase_exponent=0.5,x_exponent=-0.5,z_exponent=0)
+identity = cirq.I#cirq.PhasedXZGate(axis_phase_exponent=0.0,x_exponent=0.0,z_exponent=0)
+
+# Care must be taken to line up global and local gates, by putting all gates in a single moment.
+Nqubits = 10
+qubits = cirq.LineQubit.range(Nqubits)
+fidelity_local = []
+fidelity_global = []
+for k in range(1,Nqubits):
+    
+    # A small hack is required to bypass gate merging (https://github.com/QuEraComputing/bloqade-circuit/issues/659).
+    # Here we split the circuit into two parts to enforce that
+    # no gates are accidentally merged.
+    circuit_global1 = cirq.Circuit.from_moments(
+        cirq.Moment([identity.on(q) for q in qubits]),
+        cirq.Moment([sqrt_Y.on(q) for q in qubits]))
+    circuit_global2 = cirq.Circuit.from_moments(
+        cirq.Moment([identity.on(q) for q in qubits]),
+        cirq.Moment([sqrt_Y_dag.on(q) for q in qubits[k::]]))
+    noisy_circuit_global1 = transform_circuit(circuit_global1)
+    noisy_circuit_global2 = transform_circuit(circuit_global2)
+    noisy_circuit_global = noisy_circuit_global1 + noisy_circuit_global2
+    circuit_global = circuit_global1 + circuit_global2
+    
+    # Convert the local circuit to a noisy version.
+    circuit_local = cirq.Circuit.from_moments(
+        cirq.Moment([identity.on(q) for q in qubits]),
+        cirq.Moment([sqrt_Y.on(q) for q in qubits[0:k]]))
+    noisy_circuit_local = transform_circuit(circuit_local)
+    
+    if k==4:
+        todraw_1 = circuit_local
+        todraw_2 = circuit_global1 + circuit_global2[1::]
+    
+    # Simulate noisy circuits and compute fidelities
+    # Local:
+    clean = simulator_dm.simulate(circuit_local).final_density_matrix
+    noisy = simulator_dm.simulate(noisy_circuit_local).final_density_matrix
+    fidelity_local.append(np.trace(clean @ noisy).real)
+    # Global:
+    clean = simulator_dm.simulate(circuit_global).final_density_matrix
+    noisy = simulator_dm.simulate(noisy_circuit_global).final_density_matrix
+    fidelity_global.append(np.trace(clean @ noisy).real)
+plt.plot(range(1,Nqubits),fidelity_local,"o-",label='Local')
+plt.plot(range(1,Nqubits),fidelity_global,"o-",label='Global')
+plt.legend()
+plt.xlabel("Number of gates to apply")
+plt.ylabel("Fidelity")
+plt.axis([1,Nqubits-1,plt.axis()[2],1.0])
+plt.show()
+
+#%%
+SVGCircuit(todraw_1)
+#%%
+SVGCircuit(todraw_2)
 
 # %% [markdown]
 # # Parallelism of Static Circuits
 #
-# This tutorial describes Bloqade's tools for converting sequential quantum circuits into parallel ones and for evaluating how parallelization affects performance using realistic noise models.
+# Now, lets explore more in depth the notion of maximizing parallelism. The following is an edit of a bloqade tutorial "[Parallelism of Static Circuits](https://github.com/QuEraComputing/bloqade/pull/288)".
 #
 # Parallelism lets gates that act on disjoint qubits execute at the same time, reducing circuit depth and overall runtime. On neutral-atom quantum computers, many transversal operations (same gate type and parameters) can often be executed together in a single layer (moment).
 #
@@ -36,33 +249,21 @@
 # %% [markdown]
 # ## Example 1: GHZ Circuit
 #
-# ### What is parallelism ?
-# We take the GHZ state preparation circuit as an example:
+# We take the GHZ state preparation as an example. It prepares the state
 #
-# <div style="display: flex; justify-content: space-around; align-items: center;">
-#   <div style="text-align: center;">
-#     <img src="figures/ghz_linear_circuit.svg" alt="Linear GHZ circuit" height="300"/>
-#     <p><b>Linear GHZ circuit</b></p>
-#   </div>
-#   <div style="text-align: center;">
-#     <img src="figures/ghz_log_circuit.svg" alt="Log-depth GHZ circuit" height="300"/>
-#     <p><b>Log-depth GHZ circuit</b></p>
-#   </div>
-# </div>
+# $\sqrt{2}|\psi\rangle = |000\cdots000\rangle + |111\cdots111\rangle$
 #
-# The GHZ state can be prepared using a sequence of Hadamard and CNOT gates. In a linear (sequential) implementation, the CNOT gates are applied one after another, resulting in a circuit depth that grows linearly with the number of qubits. In contrast, a log-depth (parallel) implementation arranges the CNOT gates so that multiple gates acting on disjoint qubits can execute simultaneously, reducing the overall depth to logarithmic in the number of qubits.
-# %%
-import cirq
-import matplotlib.pyplot as plt
-import numpy as np
-from bloqade import squin, cirq_utils
-import bloqade.cirq_utils as utils
-from cirq.contrib.svg import SVGCircuit
-
+# The GHZ state can be prepared using a sequence of Hadamard and CNOT gates. In a linear (sequential) implementation, the CNOT gates are applied one after another, resulting in a circuit depth that grows linearly with the number of qubits. In contrast, a log-depth (parallel) implementation arranges the CNOT gates so that multiple gates acting on disjoint qubits can execute simultaneously, reducing the overall depth to logarithmic in the number of qubits. This comes at the cost of requiring arbitrary connectivity, which is not native to all architectures. However, it is perfect for reconfigurable neutral atom systems, which have a native "all to all" connectivity through mid-circuit atom shuttling.
 
 # %%
 def build_linear_ghz(n_qubits: int) -> cirq.Circuit:
-    """Build linear GHZ circuit using squin and convert to Cirq."""
+    """
+    Build a linear GHZ circuit using squin and convert to Cirq.
+    Inputs:
+    n_qubits: Number of qubits in the GHZ state.
+    Returns:
+    cirq.Circuit: The constructed linear GHZ circuit.
+    """
 
     @squin.kernel
     def linear_ghz_kernel():
@@ -76,15 +277,17 @@ def build_linear_ghz(n_qubits: int) -> cirq.Circuit:
     circuit = cirq_utils.emit_circuit(linear_ghz_kernel, circuit_qubits=qubits)
     return circuit
 
-linear_ghz = build_linear_ghz(8)
-SVGCircuit(linear_ghz)
-#%%
 
 def build_log_ghz(n_qubits: int) -> cirq.Circuit:
-    """Build logarithmic-depth GHZ circuit using squin and convert to Cirq."""
-    import math
+    """
+    Build logarithmic-depth GHZ circuit using squin and convert to Cirq.
+    Inputs:
+    n_qubits: Number of qubits in the GHZ state.
+    Returns:
+    cirq.Circuit: The constructed log-depth GHZ circuit.
+    """
 
-    max_iterations = math.ceil(math.log2(n_qubits)) if n_qubits > 1 else 1
+    max_iterations = int(np.ceil(np.log2(n_qubits))) if n_qubits > 1 else 1
 
     @squin.kernel
     def log_ghz_kernel():
@@ -105,7 +308,13 @@ def build_log_ghz(n_qubits: int) -> cirq.Circuit:
     return circuit
 
 
-log_ghz = build_log_ghz(8)
+linear_ghz = build_linear_ghz(12)
+log_ghz = build_log_ghz(12)
+
+# %%
+SVGCircuit(linear_ghz)
+
+# %%
 SVGCircuit(log_ghz)
 
 # %% [markdown]
@@ -127,17 +336,17 @@ SVGCircuit(log_ghz)
 noise_model = utils.noise.GeminiOneZoneNoiseModel()
 simulator = cirq.DensityMatrixSimulator()
 
-# Initialize lists to store fidelities
-fidelities_linear = []
-fidelities_log = []
 
 # %% [markdown]
 # We run noise-model simulations for circuit sizes from 3 to 9 qubits and compute the fidelity (the higher is better). The ideal noiseless circuit has fidelity 1 by construction.
 
 # %%
-qubits = range(3, 11)
+# Scan a range of qubit numbers and compute fidelities
+fidelities_linear = []
+fidelities_log = []
+num_qubits = list(range(2, 11))
 # Test both linear and log GHZ circuits with noise model
-for n in qubits:
+for n in num_qubits:
     # Linear GHZ circuit
     linear_circuit = build_linear_ghz(n)
 
@@ -166,20 +375,12 @@ for n in qubits:
     fidelities_linear.append(fidelity_linear)
     fidelities_log.append(fidelity_log)
 
-    print(f"n={n}:")
-    print(f"  Linear GHZ: {fidelity_linear:.4f}")
-    print(f"  Log GHZ: {fidelity_log:.4f}")
-
-
-# %% [markdown]
-# Fidelity comparison plot:
-
 # %%
 # Create comparison plot
 plt.figure(figsize=(10, 6))
 
 plt.plot(
-    qubits,
+    num_qubits,
     fidelities_linear,
     "ro-",
     label="Linear GHZ",
@@ -187,7 +388,7 @@ plt.plot(
     markersize=8,
 )
 plt.plot(
-    qubits,
+    num_qubits,
     fidelities_log,
     "bo-",
     label="Log-depth GHZ",
@@ -203,12 +404,11 @@ plt.title(
 )
 plt.legend(fontsize=12)
 plt.grid(True, alpha=0.3)
-plt.xticks(qubits)
-plt.axis([min(qubits)-0.5, max(qubits)+0.5, 0.6, 1.05])
-
+plt.xticks(num_qubits)
+plt.axis([1.5,10.5,0.6,1.0])
 # Add annotations for better understanding
 plt.text(
-    0.02,
+    0.15,
     0.98,
     "Higher fidelity = Better performance",
     transform=plt.gca().transAxes,
@@ -231,35 +431,46 @@ print(
 
 
 # %% [markdown]
-# The GHZ results show that parallelizing gates increases fidelity compared with the sequential implementation. The log-depth circuit consistently outperforms the linear-depth circuit, with the advantage growing as we increase the number of qubits.
+# The GHZ results show that parallelizing gates increases fidelity compared with the sequential implementation. The log-depth circuit consistently outperforms the linear-depth circuit, with the advantage growing as we increase the number of qubits. Observe that there is a jump in the fidelity at every power of two, corresponding to the addition of a new level in the log-depth circuit.
 
 # %% [markdown]
 # ## Automatic toolkits for circuit parallelization
 #
-# In the GHZ example the log-depth circuit was provided manually. Bloqade also includes automatic tools that compress a deep circuit into a more parallel form by casting the problem as an optimization (integer linear program).
+# Bloqade provides automatic tools to compress circuits into more parallel forms:
 #
-# We first transpile the circuit into a standard gate set consisting of single-qubit gates and two-qubit CZ gates. CZ gates acting on disjoint qubits commute and therefore can be placed in the same moment.
+# ```python
+# import bloqade.cirq_utils as utils
 #
-# The optimization objective encourages gates that can execute in parallel to be assigned to nearby moments. Formally, we minimize an objective such as $\sum_{g}\sum_{o_p,o_q \in g} w_g \left|t_p-t_q\right|$, where each group $g$ contains operations with a shared tag. Within each group, an attraction force of strength $w_g$ is introduced. Here $t_p$ and $t_q$ are integer labels (its epoch) of operators $o_p$ and $o_q$. Each operation (gate) can have multiple tags.
+# # Parallelize a circuit
+# parallel_circuit = utils.parallelize(circuit)
 #
-# To preserve circuit equivalence, we only reorder operations that commute. Execution dependencies are represented as a directed acyclic graph (DAG); each vertex $i$ receives an integer label $t_i$ (its epoch) and ordering constraints are expressed as inequalities on these labels. These constraints and objective terms are encoded in an integer linear program (ILP).
+# # Remove internal tags (for cleaner visualization)
+# parallel_circuit = utils.remove_tags(parallel_circuit)
+# ```
 #
-# Because the ILP formulation has totally unimodular constraint structure in our encoding, the relaxed linear program yields integer solutions, which makes the optimization efficient in practice. Absolute-value terms are reformulated into equivalent linear forms during construction.
-#
-# The helper `bloqade.utils.auto_similarity` tags operations and assigns weights to build the linear objective. Users can also add manual annotations (tags/weights) to guide the parallelizer when they need fine-grained control.
-#
+# The algorithm builds a DAG of gate dependencies (only commuting gates can be reordered), then solves an integer linear program (ILP) to assign gates to moments while minimizing circuit depth. Similar gates are attracted to the same moment via weighted objectives.
 #
 
 # %% [markdown]
 # ## Example 2: [7,1,3] Steane code circuit
+# Lets explore manual and automatic parallelism optimization on the Steane code, which is a prototypical quantum error correcting code that encodes one logical qubit into seven physical qubits, and can correct a single qubit error.
 
-# %% [markdown]
-# We construct a sequential circuit for the [7,1,3] Steane code and then apply Bloqade's parallelization utilities (which use `auto_similarity`) to compress it.
+# We construct several versions of the [7,1,3] Steane code encoder circuit, based on three different initial circuits. The `seq` circuit is designed to be the "worst" possible version of the Steane code, with as much sequential operation as possible. The `11-CNOT` circuit is the textbook version of the Steane code, which uses 11 CNOT gates to perform the encoding. The `9-CZ` circuit is an optimized version that reduces the number of entangling gates to 9 CZ gates by using √Y and √Y† gates instead of Hadamards.
+#
+# | Version | Description | Parallelization |
+# |---------|-------------|-----------------|
+# | seq | Sequential circuit using CZ gates (native to neutral atoms) | Manual |
+# | seq-auto | Auto-parallelized sequential circuit | Auto |
+# | 11-CNOT | Textbook encoder using 11 CNOT gates | Manual |
+# | 11-CNOT-auto | Auto-parallelized 11-CNOT circuit | Auto |
+# | 9-CZ | Optimized encoder using only 9 CZ gates with √Y gates | Manual |
+# | 9-CZ-auto | Auto-parallelized 9-CZ circuit | Auto |
+#
 
 
-# %% [code]
+# %%
 def build_steane_code_circuit():
-    """Build the Steane code circuit for error correction using squin and convert to Cirq."""
+    """Build the Steane code circuit (version a) using CZ gates - native to neutral atoms, but designed to be as sequential as possible."""
 
     @squin.kernel
     def steane_kernel():
@@ -297,478 +508,230 @@ def build_steane_code_circuit():
     return circuit
 
 
-# %%
-# Build Steane circuits (reuse already defined noise models and simulator)
-steane_original = build_steane_code_circuit()
-steane_parallel = utils.parallelize(circuit=steane_original)
-steane_parallel = utils.remove_tags(steane_parallel)
+def build_steane_11cnot()-> cirq.Circuit:
+    """Build the Steane code encoder (version b) with 11 CNOT gates - textbook version.
 
-# Display original circuit - renders nicely in Jupyter, shows text in terminal
-print("Original Steane Circuit:")
-try:
-    get_ipython()  # Check if we're in IPython/Jupyter
-    # In Jupyter: display as SVG (prettier visualization)
-    from IPython.display import display
-
-    display(SVGCircuit(steane_original))
-except NameError:
-    # Not in Jupyter: print text representation
-    print(steane_original)
-
-print("\nParallelized Steane Circuit:")
-try:
-    get_ipython()
-    from IPython.display import display
-
-    display(SVGCircuit(steane_parallel))
-except NameError:
-    print(steane_parallel)
-print("Original Steane circuit depth:", len(steane_original))
-print("Parallelized Steane circuit depth:", len(steane_parallel))
-
-
-# %% [markdown]
-# We perform noise analysis on both the original and parallelized Steane circuits.
-
-# %%
-# Apply noise model to both circuits
-steane_original_noisy = utils.noise.transform_circuit(
-    steane_original, model=noise_model
-)
-steane_parallel_noisy = utils.noise.transform_circuit(
-    steane_parallel, model=noise_model
-)
-
-# Simulate ideal circuits
-rho_original_ideal = simulator.simulate(steane_original).final_density_matrix
-rho_parallel_ideal = simulator.simulate(steane_parallel).final_density_matrix
-
-# Simulate noisy circuits
-rho_original_noisy = simulator.simulate(steane_original_noisy).final_density_matrix
-rho_parallel_noisy = simulator.simulate(steane_parallel_noisy).final_density_matrix
-
-# Calculate fidelities
-fidelity_original = np.trace(rho_original_ideal @ rho_original_noisy).real
-fidelity_parallel = np.trace(rho_parallel_ideal @ rho_parallel_noisy).real
-
-# Print results
-print("\n=== Steane Code Circuit Fidelity Comparison ===")
-print(f"Original circuit: {fidelity_original:.4f}")
-print(f"Parallelized circuit: {fidelity_parallel:.4f}")
-
-# Calculate improvement
-improvement = fidelity_parallel - fidelity_original
-
-print(f"\nFidelity improvement with parallelization: {improvement:+.4f}")
-
-
-# Summary analysis
-depth_reduction = len(steane_original) - len(steane_parallel)
-depth_reduction_pct = (
-    (depth_reduction / len(steane_original) * 100) if len(steane_original) > 0 else 0
-)
-
-print("\n=== Analysis Summary ===")
-print(
-    f"Circuit depth reduction: {len(steane_original)} → {len(steane_parallel)} moments"
-)
-print(f"Depth reduction: {depth_reduction} moments ({depth_reduction_pct:.1f}%)")
-if improvement > 0:
-    print("✓ Parallelization improves fidelity")
-else:
-    print("✗ Parallelization does not improve fidelity")
-
-
-# %% [markdown]
-# ## Example 3: Linear chained circuit
-#
-# Here is another example of a circuit of CZ gates in a linear chain. The original circuit has a linearly growing number of moments with the number of qubits.
-
-
-# %%
-def build_circuit3():
-    """Build a linear CZ chain circuit using squin and convert to Cirq."""
-    n = 10
+    This is the standard Steane code encoder circuit where:
+    - Qubit 6 is the data qubit |ψ⟩ to be encoded
+    - Qubits 0-5 are ancillas initialized to |0⟩
+    - H gates prepare superposition on control qubits
+    - 11 CNOT gates create the encoded state
+    """
 
     @squin.kernel
-    def cz_chain_kernel():
-        q = squin.qalloc(n)
-        for i in range(n - 1):
-            squin.cz(q[i], q[i + 1])
+    def steane_11cnot_kernel():
+        q = squin.qalloc(7)
 
-    # Create LineQubits for compatibility with existing code
-    qubits = cirq.LineQubit.range(n)
-    circuit = cirq_utils.emit_circuit(cz_chain_kernel, circuit_qubits=qubits)
+        # H gates on qubits 1, 2, 3 (ancilla preparation)
+        squin.h(q[1])
+        squin.h(q[2])
+        squin.h(q[3])
+
+        # 11 CNOT gates following textbook Steane code structure
+        # First layer of CNOTs
+        squin.cx(q[6], q[5])
+        squin.cx(q[1], q[0])
+        squin.cx(q[2], q[4])
+        squin.cx(q[2], q[0])
+        squin.cx(q[3], q[5])
+        squin.cx(q[1], q[5])
+        squin.cx(q[6], q[4])
+        squin.cx(q[2], q[6])
+        squin.cx(q[3], q[4])
+        squin.cx(q[3], q[0])
+        squin.cx(q[1], q[6])
+
+    qubits = cirq.LineQubit.range(7)
+    circuit = cirq_utils.emit_circuit(steane_11cnot_kernel, circuit_qubits=qubits)
     return circuit
 
 
-# Build the linear CZ circuit
-circuit3 = build_circuit3()
+def build_steane_9cnot()-> cirq.Circuit:
+    """Build the optimized Steane code encoder (version c) with only 9 CNOT gates.
 
-# Display original circuit - renders nicely in Jupyter, shows text in terminal
-print("Original CZ chain circuit:")
-try:
-    get_ipython()  # Check if we're in IPython/Jupyter
-    # In Jupyter: display as SVG (prettier visualization)
-    from IPython.display import display
+    This optimized version uses √Y and √Y† gates instead of some Hadamards,
+    reducing the CNOT count from 11 to 9 while maintaining circuit equivalence.
 
-    display(SVGCircuit(circuit3))
-except NameError:
-    # Not in Jupyter: print text representation
-    print(circuit3)
-
-# Parallelize the circuit, `auto_similarity` is automatically applied inside `parallelize`
-circuit3_parallel = utils.parallelize(circuit=circuit3)
-
-# Remove any tags and print the parallelized circuit
-circuit3_parallel = utils.remove_tags(circuit3_parallel)
-print("Parallelized CZ chain circuit:")
-try:
-    get_ipython()
-    from IPython.display import display
-
-    display(SVGCircuit(circuit3_parallel))
-except NameError:
-    print(circuit3_parallel)
-
-print("Original CZ chain circuit depth:", len(circuit3))
-print("Parallelized CZ chain circuit depth:", len(circuit3_parallel))
-# %% [markdown]
-# ## Example 4: 6D Hypercube Circuit
-#
-# This example demonstrates parallelization on a 6-dimensional hypercube with 64 qubits arranged in a 4×16 array, which can be implemented on our Gemini machine with (5x17) architecture.
-#
-# The 6D hypercube (2x2x2x2x2x2) is reshaped into two dimenison (4x16). Each qubit's index maps to (x, y) coordinates:
-# - Binary index: [y1][y0][x3][x2][x1][x0]
-# - x-coordinate (0-15): lower 4 bits
-# - y-coordinate (0-3): upper 2 bits
-#
-# Each of the 6 dimensions connects qubits that differ by exactly one bit, creating a highly connected quantum circuit with 192 CZ gates across 64 qubits.
-#
-
-
-# %%
-def build_hypercube():
+    The optimization exploits the structure of the Steane code to eliminate
+    redundant entangling operations.
     """
-    Build a 6D hypercube circuit with 64 qubits arranged in a 4x16 array using squin and convert to Cirq.
-
-    The hypercube structure follows the mapping from Task4 analysis:
-    - Binary index: [y1][y0][x3][x2][x1][x0]
-    - x-coordinate (0-15): lower 4 bits [x3][x2][x1][x0]
-    - y-coordinate (0-3): upper 2 bits [y1][y0]
-
-    Each of the 6 dimensions connects qubits that differ by exactly one bit:
-    - Dimension 0: flip bit 0 (x ± 1)
-    - Dimension 1: flip bit 1 (x ± 2)
-    - Dimension 2: flip bit 2 (x ± 4)
-    - Dimension 3: flip bit 3 (x ± 8)
-    - Dimension 4: flip bit 4 (y ± 1)
-    - Dimension 5: flip bit 5 (y ± 2)
-    """
-    # Create a 4x16 array of qubits (64 qubits total)
-    num_rows = 4  # y-coordinates: 0-3
-    num_cols = 16  # x-coordinates: 0-15
-
-    # Helper function to convert hypercube index to (x, y)
-    def index_to_coord(idx):
-        x = idx & 0b001111  # Lower 4 bits
-        y = (idx >> 4) & 0b11  # Upper 2 bits
-        return x, y
-
-    # Build the list of gate pairs for all 6 dimensions
-    gate_pairs = []
-
-    for dim in range(6):
-        # For each qubit, connect it to its neighbor along dimension `dim`
-        for idx in range(64):
-            # Get the neighbor by flipping bit `dim`
-            neighbor_idx = idx ^ (1 << dim)
-
-            # Only add each edge once (avoid duplicates)
-            if neighbor_idx > idx:
-                # Convert indices to coordinates
-                x1, y1 = index_to_coord(idx)
-                x2, y2 = index_to_coord(neighbor_idx)
-
-                # Verify coordinates are valid
-                if (
-                    0 <= x1 < num_cols
-                    and 0 <= y1 < num_rows
-                    and 0 <= x2 < num_cols
-                    and 0 <= y2 < num_rows
-                ):
-                    gate_pairs.append((y1, x1, y2, x2))
-
-    # Shuffle the gate pairs to make parallelization more challenging
-    # Without shuffling, gates are already grouped by dimension which makes
-    # parallelization trivial. Shuffling forces the optimizer to work harder.
-    import random
-
-    random.seed(0)  # Use seed=0 for optimal parallelization (depth 6)
-    random.shuffle(gate_pairs)
 
     @squin.kernel
-    def hypercube_kernel():
-        q = squin.qalloc(num_rows * num_cols)
-        for pair in gate_pairs:
-            # Convert 2D indices to 1D: index = y * num_cols + x
-            idx1 = pair[0] * num_cols + pair[1]
-            idx2 = pair[2] * num_cols + pair[3]
-            squin.cz(q[idx1], q[idx2])
+    def steane_9cnot_kernel():
+        q = squin.qalloc(7)
 
-    # Create GridQubits for 4x16 array (returns a flat list of 64 qubits)
-    qubits = cirq.GridQubit.rect(num_rows, num_cols)
-    circuit = cirq_utils.emit_circuit(hypercube_kernel, circuit_qubits=qubits)
+        # Initial √Y† layer on ancilla qubits (replaces H gates)
+        # √Y† = Ry(-π/2)
+        squin.ry(-np.pi / 2, q[0])
+        squin.ry(-np.pi / 2, q[1])
+        squin.ry(-np.pi / 2, q[2])
+        squin.ry(-np.pi / 2, q[3])
+        squin.ry(-np.pi / 2, q[4])
+        squin.ry(-np.pi / 2, q[5])
+
+        # First CZ layer (parallel)
+        squin.cz(q[1], q[2])
+        squin.cz(q[3], q[4])
+        squin.cz(q[5], q[6])
+
+        # √Y layer
+        squin.ry(np.pi / 2, q[6])
+
+        # Second CZ layer (parallel)
+        squin.cz(q[0], q[3])
+        squin.cz(q[2], q[5])
+        squin.cz(q[4], q[6])
+
+        # √Y layer from 2 to 6
+        squin.ry(np.pi / 2, q[2])
+        squin.ry(np.pi / 2, q[3])
+        squin.ry(np.pi / 2, q[4])
+        squin.ry(np.pi / 2, q[5])
+        squin.ry(np.pi / 2, q[6])
+
+        # Third CZ layer (parallel)
+        squin.cz(q[0], q[1])
+        squin.cz(q[2], q[3])
+        squin.cz(q[4], q[5])
+
+        # Final √Y layer
+        squin.ry(np.pi / 2, q[1])
+        squin.ry(np.pi / 2, q[2])
+        squin.ry(np.pi / 2, q[4])
+
+    qubits = cirq.LineQubit.range(7)
+    circuit = cirq_utils.emit_circuit(steane_9cnot_kernel, circuit_qubits=qubits)
     return circuit
 
 
 # %%
-# Build and analyze the hypercube circuit
-hypercube_circuit = build_hypercube()
-print("Original hypercube circuit:")
-print("Number of qubits: 64 (arranged in 4×16 array)")
-print(f"Number of gates: {len(list(hypercube_circuit.all_operations()))}")
-print(f"Circuit depth: {len(hypercube_circuit)} moments")
+# Build all Steane circuit versions (reuse already defined noise models and simulator)
+steane_seq = build_steane_code_circuit()  # Sequential CZ-based
+steane_seq_auto = utils.parallelize(circuit=steane_seq)  # Auto-parallelized
+steane_seq_auto = utils.remove_tags(steane_seq_auto)
 
-# Calculate number of edges per dimension
-# Each dimension should have 32 edges (64 qubits / 2)
-print("\nExpected edges per dimension: 32")
-print("Total edges across 6 dimensions: 192")
+steane_11cnot = build_steane_11cnot()  # 11 CNOT textbook
+steane_11cnot_auto = utils.parallelize(circuit=steane_11cnot)  # Auto-parallelized
+steane_11cnot_auto = utils.remove_tags(steane_11cnot_auto)
 
-# %% [markdown]
-# The original hypercube circuit has 192 CZ gates (32 edges per dimension × 6 dimensions).
-# The gates are shuffled randomly to make parallelization more challenging - without shuffling,
-# gates would already be grouped by dimension, making the problem trivial. After shuffling,
-# Cirq's default sequential insertion creates a deeper circuit, providing a better benchmark
-# for the parallelization optimizer.
-#
-# Visualization is generated separately. The 4×16 grid layout shows:
-# - Straight lines for nearest-neighbor interactions (Euclidean distance = 1)
-# - Curved arcs for longer-range interactions (distance > 1) to avoid overlapping
-#
-# ![Original Hypercube Circuit](figures/hypercube_original.png)
-#
-# The links with same color belongs to the same moment are executed symmataniously within one layer.
+steane_9cz = build_steane_9cnot()  # 9 CZ optimized
+steane_9cz_auto = utils.parallelize(circuit=steane_9cz)  # Auto-parallelized
+steane_9cz_auto = utils.remove_tags(steane_9cz_auto)
 
 # %% [markdown]
-# Now we try to parallel the hypbercube circuit.
+# ### seq: Sequential CZ-based Steane Circuit
 
 # %%
-# Parallelize the hypercube circuit. There're some randomness in the optimizer which leads to different results in different runs.
-print("\nParallelizing hypercube circuit...")
-hypercube_parallel = utils.parallelize(circuit=hypercube_circuit)
-hypercube_parallel = utils.remove_tags(hypercube_parallel)
-
-print(f"\nOriginal hypercube circuit depth: {len(hypercube_circuit)}")
-print(f"Parallelized hypercube circuit depth: {len(hypercube_parallel)}")
-depth_reduction = len(hypercube_circuit) - len(hypercube_parallel)
-depth_reduction_pct = depth_reduction / len(hypercube_circuit) * 100
-print(f"Depth reduction: {depth_reduction} moments ({depth_reduction_pct:.1f}%)")
+SVGCircuit(steane_seq)
 
 # %% [markdown]
-# The parallelization significantly reduces the circuit depth by identifying gates that act on
-# disjoint qubits and can execute simultaneously. The hypercube's regular structure allows many
-# gates to be grouped into the same moment.
-#
-# Visualization of the parallelized circuit shows gates colored by their assigned moment:
-#
-# ![Parallelized Hypercube Circuit](figures/hypercube_parallel.png)
-#
-# The parallelized circuit demonstrates that quantum algorithms on hypercube connectivity can
-# benefit substantially from automatic parallelization, potentially improving fidelity by
-# reducing overall execution time and exposure to decoherence.
+# ### seq-auto: Auto-Parallelized Sequential Circuit
 
-
-#%% [markdown]
-# ### QAOA / graph state preparation
-#
-# As a final example, lets consider a more real-world example of a circuit for a graph-based algorithm:
-# QAOA on MaxCut. The circuit is a variational ansatz that alternates between some entangling
-# phasor gates that encodes the objective, and a single qubit mixer layer. A common choice of combinatorial
-# problem is MaxCut, where the goal is to partition the nodes of a graph into two sets such that
-# the number of edges between the sets is maximized. In this case, there is a qubit for each vertex,
-# and the phasor consists of CZPhase gates for each edge in the graph. The ansatz is repeated p times,
-# and in the p-> infty limit recovers the exact state.
-#
-# These sorts of graph-based circuits are inherently parallel, and serve as a good example for this tutorial.
-# In particular, the CZPhase gates commute, and so an optimal parallelization can be found via an (approximate)
-# edge coloring of the graph, where each color corresponds to a moment of the circuit.
-# Additionally, a naive decomposition of CZPhase gates into CZ and single qubit rotations can lead to a lot of
-# redundant single and multi-qubit gates that can be eliminated to improve fidelity.
-
-
-#%%
-import networkx as nx
-
-
-def build_qaoa_circuit(graph: nx.Graph, gamma: list[float], beta:list[float]) -> cirq.Circuit:
-    """Build a QAOA circuit for MaxCut on the given graph"""
-    n = len(graph.nodes)
-    qbs = cirq.LineQubit.range(n)
-    circuit = cirq.Circuit()
-    assert len(gamma) == len(beta), "Length of gamma and beta must be equal"
-    for i in range(n):
-        circuit.append(cirq.H(qbs[i]))
-    for layer in range(len(gamma)):
-        for u, v in graph.edges:
-            circuit.append((cirq.Z.on(qbs[u])*cirq.Z.on(qbs[v]))**(gamma[layer]/np.pi))
-        for i in range(n):
-            circuit.append(cirq.rx(2 * beta[layer])(qbs[i]))
-    
-    # Convert to the native CZ gateset here.
-    circuit2 = cirq.optimize_for_target_gateset(circuit, gateset=cirq.CZTargetGateset())
-    return circuit2
-
-
-def build_qaoa_circuit_parallelized(graph: nx.Graph, gamma: list[float], beta:list[float]) -> cirq.Circuit:
-    """Build and parallelize a QAOA circuit for MaxCut on the given graph"""
-    n = len(graph.nodes)
-    qbs = cirq.LineQubit.range(n)
-    circuit = cirq.Circuit()
-    assert len(gamma) == len(beta), "Length of gamma and beta must be equal"
-    
-    # A smarter implementation would use the Misra–Gries algorithm,
-    # which gives a guaranteed Delta+1 coloring, consistent with
-    # Vizing's theorem for edge coloring.
-    # However, networkx does not have an implementation of this algorithm,
-    # so we use greedy coloring as an approximation. This does not guarantee
-    # optimal depth, but works reasonably well in practice.
-    linegraph = nx.line_graph(graph)
-    best = 1e99
-    for strategy in ["largest_first", "random_sequential", "smallest_last", "independent_set",
-                     "connected_sequential_bfs", "connected_sequential_dfs", "saturation_largest_first"]:
-        coloring:dict = nx.coloring.greedy_color(linegraph, strategy=strategy)
-        num_colors = len(set(coloring.values()))
-        if num_colors < best:
-            best = num_colors
-            best_coloring = coloring
-    coloring:dict = best_coloring
-    colors = [[edge for edge, color in coloring.items() if color == c] for c in set(coloring.values())]
-    
-    print(len(colors))
-    # We will explicitly decompose CZPhase into CZ and single-qubit
-    # rotations. This can be done with the following identity:
-    # --o---    ----o--------o----
-    #   |      =    |        |
-    # -Z(t)-    -H--Z--X(t)--Z--H-
-    
-    # To cancel repeated Hadamards, we can select which qubit
-    # of each gate pair to apply the Hadamards on. The minimum
-    # number of Hadamards is equal to the size of the minimum vertex cover
-    # of the graph. Finding the minimum vertex cover is NP-hard,
-    # but we can use a greedy MIS heuristic instead.
-    mis = nx.algorithms.approximation.maximum_independent_set(graph)
-    hadamard_qubits = set(graph.nodes) - set(mis)
-    
-    
-    # Now, build the circuit using the insight from coloring and cover.
-    moment = []
-    for i in range(n):
-        moment.append(cirq.H(qbs[i]))
-    circuit.append(cirq.Moment(moment))
-    for layer in range(len(gamma)):
-        for color_group in colors:
-            # Explicitly decompose CZPhase into CZ and single-qubit layers,
-            # and be explicit with moments to maximize parallelism.
-            # --
-            moment = []
-            for u,v in color_group:
-                if u in hadamard_qubits:
-                    moment.append(cirq.H(qbs[u]))
-                else:
-                    moment.append(cirq.H(qbs[v]))
-            circuit.append(cirq.Moment(moment))
-            # --
-            moment = []
-            for u, v in color_group:
-                moment.append(cirq.CZ(qbs[u], qbs[v]))
-            circuit.append(cirq.Moment(moment))
-            moment = []
-            for u,v in color_group:
-                if u in hadamard_qubits:
-                    moment.append(cirq.X(qbs[u])**(gamma[layer]/np.pi))
-                else:
-                    moment.append(cirq.X(qbs[v])**(gamma[layer]/np.pi))
-            circuit.append(cirq.Moment(moment))
-            # --
-            moment = []
-            for u, v in color_group:
-                moment.append(cirq.CZ(qbs[u], qbs[v]))
-            circuit.append(cirq.Moment(moment))
-            # --
-            moment = []
-            for u,v in color_group:
-                if u in hadamard_qubits:
-                    moment.append(cirq.H(qbs[u]))
-                else:
-                    moment.append(cirq.H(qbs[v]))
-            circuit.append(cirq.Moment(moment))
-        moment = []
-        for i in range(n):
-            moment.append(cirq.rx(2 * beta[layer])(qbs[i]))
-        circuit.append(cirq.Moment(moment))
-    
-    # This circuit will have some redundant doubly-repeated Hadamards that can be removed.
-    # Lets do that now by merging single qubit gates to phased XZ gates, which is the native
-    # single-qubit gate on neutral atoms.
-    circuit2 = cirq.merge_single_qubit_moments_to_phxz(circuit)
-    # Do any last optimizing...
-    circuit3 = cirq.optimize_for_target_gateset(circuit2, gateset=cirq.CZTargetGateset())
-
-    return circuit3
-
-#%% [markdown]
-# Now we can compare the depth of the naive version that is not hardware aware,
-# to the hand-tuned parallelized version.
-#
-# There is a third intermediate option between a fully naive and fully hand-tuned
-# circuit, by using autoparallelism. This uses an integer linear program solver
-# to minimize the average depth of the circuit by re-ordering commuting gates.
-# For more details, see [this page]().
-#%%
-graph = nx.random_regular_graph(d=3, n=40, seed=42)
-qaoa_naive = build_qaoa_circuit(graph, gamma=[np.pi/2], beta=[np.pi/4])
-qaoa_autoparallel = utils.parallelize(qaoa_naive)
-qaoa_parallel = build_qaoa_circuit_parallelized(graph, gamma=[np.pi/2], beta=[np.pi/4])
-print("Naive QAOA circuit depth:    ", len(qaoa_naive))
-print("Auto'd QAOA circuit depth:   ", len(qaoa_autoparallel))
-print("Parallel QAOA circuit depth: ", len(qaoa_parallel))
-#%% [markdown]
-# We can see that the hand-tuned parallel version has the lowest depth and thus
-# will have the best performance. The autoparallelized version is slightly better than the naive.
-# Lets check out what the circuits look like, and simulate them on smaller graphs to compare fidelities.
-#%%
-
-
-graph = nx.random_regular_graph(d=3, n=10, seed=42)
-qaoa_naive = build_qaoa_circuit(graph, gamma=[np.pi/2], beta=[np.pi/4])
-qaoa_parallel = build_qaoa_circuit_parallelized(graph, gamma=[np.pi/2], beta=[np.pi/4])
-qaoa_autoparallel = utils.parallelize(qaoa_naive)
-#%%
-SVGCircuit(qaoa_naive)
-#%%
-SVGCircuit(qaoa_parallel)
 # %%
+SVGCircuit(steane_seq_auto)
 
-# Apply noise model
-qaoa_naive_noisy = utils.noise.transform_circuit(
-    qaoa_naive, model=noise_model
-)
-qaoa_parallel_noisy = utils.noise.transform_circuit(qaoa_parallel, model=noise_model)
+# %% [markdown]
+# ### 11-CNOT: Textbook Steane Encoder
 
-# Simulate noiseless circuits
-rho_naive = simulator.simulate(qaoa_naive).final_density_matrix
-rho_parallel = simulator.simulate(qaoa_parallel).final_density_matrix
+# %%
+SVGCircuit(steane_11cnot)
 
-# Simulate noisy circuits
-rho_naive_noisy = simulator.simulate(qaoa_naive_noisy).final_density_matrix
-rho_parallel_noisy = simulator.simulate(qaoa_parallel_noisy).final_density_matrix
+# %% [markdown]
+# ### 11-CNOT-auto: Auto-Parallelized 11-CNOT Circuit
 
-# Calculate fidelities
-fidelity_naive = np.trace(rho_naive @ rho_naive_noisy).real
-fidelity_parallel = np.trace(rho_parallel @ rho_parallel_noisy).real
-print(f"Naive QAOA circuit fidelity: {fidelity_naive:.4f}"
-      )
-print(f"Parallel QAOA circuit fidelity: {fidelity_parallel:.4f}"
-      )
+# %%
+SVGCircuit(steane_11cnot_auto)
+
+# %% [markdown]
+# ### 9-CZ: Optimized Steane Encoder
+
+# %%
+SVGCircuit(steane_9cz)
+
+# %% [markdown]
+# ### 9-CZ-auto: Auto-Parallelized 9-CZ Circuit
+
+# %%
+SVGCircuit(steane_9cz_auto)
+
+# %% [markdown]
+# ### Circuit Depths
+# A lower depth is heuristically better than higher depth due to spectator errors on idle qubits.
+
+# %%
+print(f"seq:          {len(steane_seq)} moments")
+print(f"seq-auto:     {len(steane_seq_auto)} moments")
+print(f"11-CNOT:      {len(steane_11cnot)} moments")
+print(f"11-CNOT-auto: {len(steane_11cnot_auto)} moments")
+print(f"9-CZ:         {len(steane_9cz)} moments")
+print(f"9-CZ-auto:    {len(steane_9cz_auto)} moments")
+
+
+# %% [markdown]
+# ### Noise Analysis
+
+# %%
+# Compute fidelities for all circuit versions
+steane_circuits = {
+    "seq": steane_seq,
+    "seq-auto": steane_seq_auto,
+    "11-CNOT": steane_11cnot,
+    "11-CNOT-auto": steane_11cnot_auto,
+    "9-CZ": steane_9cz,
+    "9-CZ-auto": steane_9cz_auto,
+}
+
+steane_fidelities = {}
+for name, circuit in steane_circuits.items():
+    noisy = utils.noise.transform_circuit(circuit, model=noise_model)
+    rho_ideal = simulator.simulate(circuit).final_density_matrix
+    rho_noisy = simulator.simulate(noisy).final_density_matrix
+    steane_fidelities[name] = np.trace(rho_ideal @ rho_noisy).real
+
+# Print summary
+print(f"{'Version':<15} {'Depth':<10} {'Fidelity':<10}")
+print("-" * 35)
+for name, circuit in steane_circuits.items():
+    print(f"{name:<15} {len(circuit):<10} {steane_fidelities[name]:.4f}")
+
+best_version = max(steane_fidelities, key=steane_fidelities.get)
+print(f"\nBest: {best_version} ({steane_fidelities[best_version]:.4f})")
+
+# %% [markdown]
+# Fidelity comparison plot for all Steane code versions:
+
+# %%
+fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+
+labels = ["seq", "seq\nauto", "11-CNOT", "11-CNOT\nauto", "9-CZ", "9-CZ\nauto"]
+fidelity_vals = list(steane_fidelities.values())
+depth_vals = [len(c) for c in steane_circuits.values()]
+colors = ["#c0392b", "#e74c3c", "#d68910", "#f4d03f", "#1e8449", "#58d68d"]
+
+for ax, vals, ylabel, title in [
+    (ax1, fidelity_vals, "Fidelity", "Steane Code: Fidelity"),
+    (ax2, depth_vals, "Circuit Depth", "Steane Code: Depth"),
+]:
+    bars = ax.bar(labels, vals, color=colors, edgecolor="black")
+    ax.set_ylabel(ylabel, fontsize=12)
+    ax.set_title(title, fontsize=14)
+    ax.grid(axis="y", alpha=0.3)
+    for bar, v in zip(bars, vals):
+        fmt = f"{v:.3f}" if isinstance(v, float) else str(v)
+        ax.text(
+            bar.get_x() + bar.get_width() / 2,
+            bar.get_height() + 0.01,
+            fmt,
+            ha="center",
+            fontsize=9,
+            fontweight="bold",
+        )
+ax1.set_ylim(0, 1)
+plt.tight_layout()
+plt.show()
+
+# %% [markdown]
+# As expected, the manual and optimized circuits do better than their naively optimized counterparts. The "worst case" sequential circuit has the lowest fidelity, while the auto-optimized 9 CZ circuit has the highest fidelity. However, this also comes with a point of warning: the noise model is not a perfect representation of real hardware. In practice, the hand optimized 9-CZ circuit was implemented as part of QuEra's [magic state distillation paper](https://arxiv.org/abs/2412.15165), which suggests that the noise model is not aligned with hardware. The next steps after manual and automatic optimization should be implementation and tuning on real hardware.
+
+
 # %%
